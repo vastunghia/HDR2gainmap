@@ -171,6 +171,8 @@ This project adapts and extends those ideas with:
 - optional SDR-base workflow,
 - batch processing, and an Apple-friendly export path.
 
+The code was written with extensive support from ChatGPT 5.
+
 ---
 
 ## License
