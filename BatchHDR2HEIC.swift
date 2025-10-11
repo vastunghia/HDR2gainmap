@@ -4,7 +4,7 @@ import CoreImage.CIFilterBuiltins
 import ImageIO
 
 // -----------------------------------------------------------------------------
-// Configuration: fixed relative folders as requested
+// Configuration
 // -----------------------------------------------------------------------------
 let inputHDRDir  = URL(fileURLWithPath: "./input_HDR/", isDirectory: true)
 let inputSDRDir  = URL(fileURLWithPath: "./input_SDR/", isDirectory: true)
@@ -18,6 +18,17 @@ guard FileManager.default.fileExists(atPath: inputHDRDir.path, isDirectory: &isD
 if !FileManager.default.fileExists(atPath: outputDir.path, isDirectory: &isDir) {
     do { try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true) }
     catch { fputs("Cannot create output dir: \(error)\n", stderr); exit(73) }
+}
+
+// Optional CLI flag: --suffix <text>  (e.g. --suffix sdrtm → file_sdrtm.heic)
+let cli = CommandLine.arguments
+var outputSuffix = ""
+if let i = cli.firstIndex(of: "--suffix"), i + 1 < cli.count {
+    outputSuffix = cli[i + 1]
+    // small sanitize: if non-empty and no leading separator, prepend "_"
+    if !outputSuffix.isEmpty && !outputSuffix.hasPrefix("_") && !outputSuffix.hasPrefix("-") {
+        outputSuffix = "_" + outputSuffix
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -173,7 +184,9 @@ for hdrURL in hdrFiles {
     autoreleasepool {
         let basename = hdrURL.deletingPathExtension().lastPathComponent
         let sdrURL = inputSDRDir.appendingPathComponent(basename).appendingPathExtension("png")
-        let outURL = outputDir.appendingPathComponent(basename).appendingPathExtension("heic")
+        let outURL = outputDir
+            .appendingPathComponent(basename + outputSuffix)
+            .appendingPathExtension("heic")
         fputs("Processing \(basename)…\n", stderr)
 
         // Load HDR (with headroom preserved)
@@ -199,6 +212,7 @@ for hdrURL in hdrFiles {
         let hasSDR = FileManager.default.fileExists(atPath: sdrURL.path)
         let sdrBase: CIImage
         if hasSDR {
+            fputs("  Found SDR counterpart, using it as base image\n", stderr)
             // --- Branch A: SDR provided ---
             guard let sdr = CIImage(contentsOf: sdrURL) else {
                 fputs("  ! Cannot read SDR: \(sdrURL.path)\n", stderr); return
@@ -218,6 +232,7 @@ for hdrURL in hdrFiles {
             }
             sdrBase = sdr
         } else {
+            fputs("  SDR image not found, producing one by tonemapping\n", stderr)
             // --- Branch B: Tonemap SDR from HDR ---
             guard let sdr = tonemapSDR(from: hdr, headroomRatio: headroomRatio) else {
                 fputs("  ! Tonemapping failed\n", stderr); return
@@ -251,9 +266,10 @@ for hdrURL in hdrFiles {
         }
 
         // Build a temporary in-memory HEIC from (SDR base, HDR) so the encoder computes a gain map
-        let tmpOptions: [CIImageRepresentationOption: Any] = [
-            .hdrImage: hdr,
-            .hdrGainMapAsRGB: false
+        let tmpOptions: [CIImageRepresentationOption : Any] = [
+            kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 1.0, // no impact
+            CIImageRepresentationOption.hdrImage: hdr,
+            CIImageRepresentationOption.hdrGainMapAsRGB: false
         ]
         guard let tmpData = encodeCtx.heifRepresentation(of: sdrBase,
                                                          format: .RGB10,
@@ -261,6 +277,7 @@ for hdrURL in hdrFiles {
                                                          options: tmpOptions) else {
             fputs("  ! Failed to build temp HEIC\n", stderr); return
         }
+        
         // Extract the auxiliary HDR gain map image from the temporary HEIC
         guard let gainMap = CIImage(data: tmpData, options: [.auxiliaryHDRGainMap: true]) else {
             fputs("  ! Failed to extract gain map from temp HEIC\n", stderr); return
