@@ -115,6 +115,7 @@ mkdir -p input_HDR input_SDR output_HDR_with_gainmap
 ```bash
 ./hdr2gainmap
 ```
+Use the optional `--suffix` argument to pass a string to be appended to file name.
 
 The program logs progress to **stderr** and writes `*.heic` files to:
 
