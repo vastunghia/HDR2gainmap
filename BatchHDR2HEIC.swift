@@ -4,6 +4,164 @@ import CoreImage.CIFilterBuiltins
 import ImageIO
 
 // -----------------------------------------------------------------------------
+// Thread-Safe Logger
+// -----------------------------------------------------------------------------
+
+final class Logger {
+    private let queue = DispatchQueue(label: "logger.serial")
+    private let showDebug: Bool
+    private let verbose: Bool
+    private let writeLog: Bool
+    private let logFileURL: URL?
+    private let enableColor: Bool
+    
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+    
+    init(debug: Bool, verbose: Bool = false, writeLog: Bool = false, logFile: String? = nil, enableColor: Bool = true) {
+        self.showDebug = debug
+        self.verbose = verbose
+        self.writeLog = writeLog
+        // Colors active only if required and if stderr is a TTY
+        self.enableColor = enableColor && isatty(fileno(stderr)) != 0
+        if let path = logFile, writeLog {
+            self.logFileURL = URL(fileURLWithPath: path)
+        } else {
+            self.logFileURL = nil
+        }
+    }
+    
+    func log(_ message: String, file: String? = nil, level: LogLevel = .info) {
+        queue.async {
+            var fullMessage = self.makePrefix(file: file, level: level) + message + "\n"
+            if self.enableColor {
+                 fullMessage = self.colorize(fullMessage, level: level)
+            }
+            // Write to log file if enabled
+            if self.writeLog, let url = self.logFileURL {
+                self.appendToLogFile(fullMessage, url: url)
+            }
+            
+            // Print to stderr only if verbose
+            if self.verbose {
+                fputs(fullMessage, stderr)
+            }
+        }
+    }
+    
+    private func colorize(_ s: String, level: LogLevel) -> String {
+        let reset = "\u{001B}[0m"
+        let code: String
+        switch level {
+        case .success: code = "\u{001B}[32m" // green
+        case .warning: code = "\u{001B}[33m" // yellow
+        case .error:   code = "\u{001B}[31m" // red
+        case .debug:   code = "\u{001B}[90m" // grey
+        case .info:    code = ""             // neutral
+        }
+        return code.isEmpty ? s : code + s + reset
+    }
+    
+    func debug(_ message: String, file: String? = nil) {
+        guard showDebug else { return }
+        log(message, file: file, level: .debug)
+    }
+    
+    private func appendToLogFile(_ message: String, url: URL) {
+        let data = message.data(using: .utf8) ?? Data()
+        
+        if !FileManager.default.fileExists(atPath: url.path) {
+            // Create file with session header
+            let header = "\n=== Session started at \(Date()) ===\n"
+            let headerData = header.data(using: .utf8) ?? Data()
+            try? headerData.write(to: url)
+        }
+        
+        if let fileHandle = try? FileHandle(forWritingTo: url) {
+            fileHandle.seekToEndOfFile()
+            fileHandle.write(data)
+            fileHandle.closeFile()
+        }
+    }
+    
+    private func makePrefix(file: String?, level: LogLevel) -> String {
+        var components: [String] = []
+        
+        components.append("[\(Logger.timeFormatter.string(from: Date()))]")
+        components.append(level.emoji)
+        
+        if let file = file {
+            components.append("[\(file)]")
+        }
+        
+        return components.joined(separator: " ") + " "
+    }
+    
+    enum LogLevel {
+        case info, success, warning, error, debug
+        
+        var emoji: String {
+            switch self {
+            case .info:    return "•"
+            case .success: return "✔"
+            case .warning: return "⚠"
+            case .error:   return "✗"
+            case .debug:   return "🔍"
+            }
+        }
+    }
+}
+
+final class RunStats {
+    private let q = DispatchQueue(label: "runstats.serial")
+    private(set) var total = 0
+    private(set) var written = 0
+    private(set) var skipped: [(file: String, reason: String)] = []
+    private(set) var failed:  [(file: String, reason: String)] = []
+    
+    func setTotal(_ n: Int) { q.sync { total = n } }
+    func incWritten() { q.sync { written += 1 } }
+    func addSkipped(_ f: String, _ why: String) { q.sync { skipped.append((f, why)) } }
+    func addFailed(_ f: String, _ why: String)  { q.sync { failed.append((f, why)) } }
+}
+
+func printSummary(stats: RunStats, color: Bool) {
+    let red    = color ? "\u{001B}[31m" : ""
+    let yellow = color ? "\u{001B}[33m" : ""
+    let green  = color ? "\u{001B}[32m" : ""
+    let bold   = color ? "\u{001B}[1m"  : ""
+    let reset  = color ? "\u{001B}[0m"  : ""
+    
+    let failedCount  = stats.failed.count
+    let skippedCount = stats.skipped.count
+    let written      = stats.written
+    let total        = stats.total
+    
+    fputs("\n\(bold)======== Summary ========\(reset)\n", stderr)
+    fputs("Total HDR files: \(total)\n", stderr)
+    fputs("\(green)Written: \(written)\(reset)\n", stderr)
+    fputs("\(yellow)Skipped: \(skippedCount)\(reset)\n", stderr)
+    fputs("\(red)Failed:  \(failedCount)\(reset)\n", stderr)
+    
+    if skippedCount > 0 {
+        fputs("\n\(yellow)Skipped files:\(reset)\n", stderr)
+        for item in stats.skipped {
+            fputs("  • \(item.file) — \(item.reason)\n", stderr)
+        }
+    }
+    if failedCount > 0 {
+        fputs("\n\(red)Failed files:\(reset)\n", stderr)
+        for item in stats.failed {
+            fputs("  • \(item.file) — \(item.reason)\n", stderr)
+        }
+    }
+    fputs("\(bold)==========================\(reset)\n", stderr)
+}
+
+// -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 let input_hdr_dir  = URL(fileURLWithPath: "./input_HDR/", isDirectory: true)
@@ -11,16 +169,6 @@ let input_sdr_dir  = URL(fileURLWithPath: "./input_SDR/", isDirectory: true)
 let output_dir     = URL(fileURLWithPath: "./output_HDR_with_gainmap/", isDirectory: true)
 let output_clipped_mask_dir    = URL(fileURLWithPath: "./output_clipped_mask/", isDirectory: true)
 let output_clipped_overlay_dir = URL(fileURLWithPath: "./output_clipped_overlay/", isDirectory: true)
-
-// Ensure folders exist (HDR input must exist; create output if missing)
-var is_dir: ObjCBool = false
-guard FileManager.default.fileExists(atPath: input_hdr_dir.path, isDirectory: &is_dir), is_dir.boolValue else {
-    fputs("Missing folder: \(input_hdr_dir.path)\n", stderr); exit(73)
-}
-if !FileManager.default.fileExists(atPath: output_dir.path, isDirectory: &is_dir) {
-    do { try FileManager.default.createDirectory(at: output_dir, withIntermediateDirectories: true) }
-    catch { fputs("Cannot create output dir: \(error)\n", stderr); exit(73) }
-}
 
 // number of bins when building histograms (max allowed by CIAreaHistogram is 2048)
 let CI_HISTOGRAM_MAX_BINS = 2048
@@ -41,6 +189,13 @@ struct Options {
     var emit_masked_image: Bool = false
     var masked_color: String = "magenta"
     var debug: Bool = false
+    var parallel: Bool = false
+    var max_concurrent: Int = ProcessInfo.processInfo.activeProcessorCount
+    var verbose: Bool = false
+    var write_log: Bool = false
+    var log_file: String = "./hdr2gainmap.log"
+    var no_color: Bool = false
+    var do_not_verify: Bool = false
 }
 
 @discardableResult
@@ -49,7 +204,9 @@ func print_usage(_ prog: String) -> Int32 {
     Usage:
       \(prog) [--suffix <text>] [--peak_percentile [value]] [--peak_max]
              [--tonemap_ratio <0..1>] [--heic_compression_quality <0..1>]
-             [--tonemap_dryrun] [--emit_clip_mask] [--emit_masked_image [color]] [--debug]
+             [--tonemap_dryrun] [--emit_clip_mask] [--emit_masked_image [color]]
+             [--parallel] [--max_concurrent <n>]
+             [--verbose] [--write_log [path]] [--do_not_verify] [--no_color] [--debug]
 
     Options:
       --suffix <text>                 Suffix appended to output filename (e.g. "_sdrtm")
@@ -62,8 +219,21 @@ func print_usage(_ prog: String) -> Int32 {
                                       (ignored if an SDR file already exists)
       --emit_masked_image [col]       Also write SDR with clipped pixels painted (name or #RRGGBB; default: magenta)
                                       (ignored if an SDR file already exists)
-      --debug                         Print verbose debug messages
+      --parallel                      Enable parallel processing of files
+      --max_concurrent <n>            Max concurrent file processing (default: CPU count)
+      --verbose                       Print detailed log messages to stderr (disables progress bar)
+      --write_log [path]              Write log messages to file (default: ./hdr2gainmap.log)
+                                      Progress bar remains active unless --verbose is also used
+      --no_color                      Disable ANSI colors in console output
+      --do_not_verify                 Skip post-export gain-map verification (default: verify)
+      --debug                         Print verbose debug messages (implies --verbose)
       --help                          Show this message
+
+    Logging Behavior:
+      • Default:         Progress bar only, no console output
+      • --verbose:       Detailed console output, no progress bar
+      • --write_log:     Log to file + progress bar
+      • --debug:         Debug mode implies --verbose (console output, no progress bar)
 
     """, stderr)
     return 64
@@ -75,7 +245,8 @@ func parse_options(_ argv: [String]) -> Options {
         "--suffix","--peak_percentile","--peak_max","--tonemap_ratio",
         "--heic_compression_quality",
         "--tonemap_dryrun","--emit_clip_mask","--emit_masked_image",
-        "--debug","--help"
+        "--parallel","--max_concurrent",
+        "--verbose","--write_log","--no_color","--do_not_verify","--debug","--help"
     ])
     var i = 1
     let n = argv.count
@@ -106,7 +277,6 @@ func parse_options(_ argv: [String]) -> Options {
                 opts.peak_max = false
                 i += 2
             } else {
-                // no value provided: enable percentile with default 99.9
                 opts.use_percentile = true
                 opts.peak_max = false
                 i += 1
@@ -149,8 +319,43 @@ func parse_options(_ argv: [String]) -> Options {
                 opts.masked_color = argv[i+1]; i += 2
             } else { i += 1 }
 
+        case "--parallel":
+            opts.parallel = true
+            i += 1
+
+        case "--max_concurrent":
+            guard i+1 < n, !argv[i+1].hasPrefix("-"),
+                  let v = Int(argv[i+1]), v > 0 else {
+                fputs("Option --max_concurrent requires a positive integer.\n", stderr)
+                exit(print_usage(prog))
+            }
+            opts.max_concurrent = v
+            i += 2
+
+        case "--verbose":
+            opts.verbose = true
+            i += 1
+
+        case "--write_log":
+            opts.write_log = true
+            if i+1 < n, !argv[i+1].hasPrefix("-") {
+                opts.log_file = argv[i+1]
+                i += 2
+            } else {
+                i += 1
+            }
+            
+        case "--no_color":
+            opts.no_color = true
+            i += 1
+            
+        case "--do_not_verify":
+            opts.do_not_verify = true
+            i += 1
+
         case "--debug":
             opts.debug = true
+            opts.verbose = true  // debug implies verbose
             i += 1
 
         default:
@@ -160,30 +365,126 @@ func parse_options(_ argv: [String]) -> Options {
     return opts
 }
 
-
 let options = parse_options(CommandLine.arguments)
+let logger = Logger(debug: options.debug,
+                    verbose: options.verbose,
+                    writeLog: options.write_log,
+                    logFile: options.log_file,
+                    enableColor: !options.no_color)
 
-@inline(__always)
-func dbg_log(_ message: @autoclosure () -> String) {
-    if options.debug { fputs(message(), stderr) }
+/// Progress bar
+final class ProgressBar {
+    private let queue = DispatchQueue(label: "progressbar.serial")
+    private var current: Int = 0
+    private let total: Int
+    private let enabled: Bool
+    private let width: Int = 40
+    private var hasPrintedInitial = false
+    
+    init(total: Int, enabled: Bool) {
+        self.total = total
+        self.enabled = enabled
+    }
+    
+    /// Prints progress bar immediatly @0% (before any job finishes)
+    func showInitial(fileName: String? = nil) {
+         guard enabled else { return }
+         queue.sync {
+            // evita doppie stampe dello 0% se chiamata più volte
+            guard !hasPrintedInitial else { return }
+            hasPrintedInitial = true
+            self.render(fileName: fileName)
+        }
+    }
+    
+    func increment(fileName: String? = nil) {
+        guard enabled else { return }
+        
+        queue.sync {
+            self.current += 1
+            self.render(fileName: fileName)
+        }
+    }
+    
+    private func render(fileName: String?) {
+        let percentage = Float(current) / Float(total)
+        let filled = Int(percentage * Float(width))
+        let empty = width - filled
+        
+        let bar = String(repeating: "█", count: filled) + String(repeating: "░", count: empty)
+        let percent = String(format: "%.1f%%", percentage * 100)
+        
+        var line = "\r[\(bar)] \(current)/\(total) (\(percent))"
+        if let file = fileName {
+            line += " - \(file)"
+        }
+        
+        // Pad with spaces to clear previous text
+        line += String(repeating: " ", count: 20)
+        
+        fputs(line, stderr)
+        fflush(stderr)
+        
+        if current >= total {
+            fputs("\n", stderr)
+        }
+    }
+    
+    func finish() {
+        guard enabled else { return }
+        // Flush: make sure that queued renders if any are completed
+        queue.sync { /* no-op */ }
+        fputs("\n", stderr)
+        fflush(stderr)
+    }
+}
+
+// Early folder validation
+var is_dir: ObjCBool = false
+guard FileManager.default.fileExists(atPath: input_hdr_dir.path, isDirectory: &is_dir), is_dir.boolValue else {
+    logger.log("Missing folder: \(input_hdr_dir.path)", level: .error)
+    exit(73)
+}
+if !FileManager.default.fileExists(atPath: output_dir.path, isDirectory: &is_dir) {
+    do {
+        try FileManager.default.createDirectory(at: output_dir, withIntermediateDirectories: true)
+        logger.log("Created output directory: \(output_dir.path)")
+    }
+    catch {
+        logger.log("Cannot create output dir: \(error)", level: .error)
+        exit(73)
+    }
 }
 
 if options.use_percentile && options.debug {
-    fputs("  (debug) Note: --tonemap_ratio is ignored with --peak_percentile.\n", stderr)
+    logger.debug("Note: --tonemap_ratio is ignored with --peak_percentile.")
 }
-// Create optional output folders only if requested by CLI flags
+
+// Create optional output folders
 if options.emit_clip_mask {
     var is_dir2: ObjCBool = false
     if !FileManager.default.fileExists(atPath: output_clipped_mask_dir.path, isDirectory: &is_dir2) {
-        do { try FileManager.default.createDirectory(at: output_clipped_mask_dir, withIntermediateDirectories: true) }
-        catch { fputs("Cannot create output_clipped_mask dir: \(error)\n", stderr); exit(73) }
+        do {
+            try FileManager.default.createDirectory(at: output_clipped_mask_dir, withIntermediateDirectories: true)
+            logger.log("Created clip mask directory: \(output_clipped_mask_dir.path)")
+        }
+        catch {
+            logger.log("Cannot create output_clipped_mask dir: \(error)", level: .error)
+            exit(73)
+        }
     }
 }
 if options.emit_masked_image {
     var is_dir3: ObjCBool = false
     if !FileManager.default.fileExists(atPath: output_clipped_overlay_dir.path, isDirectory: &is_dir3) {
-        do { try FileManager.default.createDirectory(at: output_clipped_overlay_dir, withIntermediateDirectories: true) }
-        catch { fputs("Cannot create output_clipped_overlay dir: \(error)\n", stderr); exit(73) }
+        do {
+            try FileManager.default.createDirectory(at: output_clipped_overlay_dir, withIntermediateDirectories: true)
+            logger.log("Created overlay directory: \(output_clipped_overlay_dir.path)")
+        }
+        catch {
+            logger.log("Cannot create output_clipped_overlay dir: \(error)", level: .error)
+            exit(73)
+        }
     }
 }
 
@@ -191,7 +492,20 @@ if options.emit_masked_image {
 // Utilities
 // -----------------------------------------------------------------------------
 
+/// Check for gain map
+@Sendable
+func verifyGainMap(at url: URL, fileName: String) -> Bool {
+    // Se riusciamo a leggere l’immagine ausiliaria HDR gain map, allora è presente.
+    if let _ = CIImage(contentsOf: url, options: [.auxiliaryHDRGainMap: true]) {
+        logger.debug("Gain map verified present", file: fileName)
+        return true
+    } else {
+        return false
+    }
+}
+
 /// Parse a color string into CIColor. Accepts simple names or "#RRGGBB".
+@Sendable
 func parse_color(_ s: String) -> CIColor {
     let lower = s.lowercased()
     switch lower {
@@ -214,12 +528,14 @@ func parse_color(_ s: String) -> CIColor {
 }
 
 /// Return the canonical CGColorSpace name as String (or nil if untagged)
+@Sendable
 func cs_name(_ cs: CGColorSpace?) -> String? {
     guard let cs = cs, let name = cs.name else { return nil }
     return name as String
 }
 
 /// Put linear luminance (Y) in R; zero G/B; A=1.
+@Sendable
 func linear_luma(_ src: CIImage) -> CIImage {
     let m = CIFilter.colorMatrix()
     m.inputImage = src
@@ -232,6 +548,7 @@ func linear_luma(_ src: CIImage) -> CIImage {
 }
 
 /// Measure a linear-light luminance peak proxy in extended linear P3 using CIAreaMaximum.
+@Sendable
 func max_luminance_hdr(from ci_image: CIImage,
                        context: CIContext,
                        linear_cs: CGColorSpace) -> Float? {
@@ -253,11 +570,13 @@ func max_luminance_hdr(from ci_image: CIImage,
 }
 
 /// Linear-luminance percentile (robust peak) in extended linear P3.
+@Sendable
 func percentile_headroom(from ci_image: CIImage,
                          context: CIContext,
                          linear_cs: CGColorSpace,
                          bins: Int = 1024,
-                         percentile: Float = 99.9) -> Float? {
+                         percentile: Float = 99.9,
+                         fileName: String? = nil) -> Float? {
     let bin_count = min(max(bins, 1), 2048)
 
     guard let abs_max = max_luminance_hdr(from: ci_image, context: context, linear_cs: linear_cs),
@@ -310,20 +629,22 @@ func percentile_headroom(from ci_image: CIImage,
     let y_percentile = Float(v_norm) * abs_max
 
     let reached = cdf[k] / total
-    dbg_log(String(format:
-      "    [percentile_headroom-debug] bins=%d absMax=%.6f target=%.1f%% k=%d  vNorm=%.6f  CDF=%.4f  yPercentile=%.6f headroom=%.6f\n",
+    logger.debug(String(format:
+      "percentile_headroom: bins=%d absMax=%.6f target=%.1f%% k=%d vNorm=%.6f CDF=%.4f yPercentile=%.6f headroom=%.6f",
       bin_count, abs_max, Double(percentile), k, v_norm, reached, Double(y_percentile), Double(max(y_percentile, 1.0))
-    ))
+    ), file: fileName)
 
     return max(y_percentile, 1.0)
 }
 
 /// Fraction of pixels with linear luminance above a threshold (headroom).
+@Sendable
 func fraction_above_headroom_threshold(from ci_image: CIImage,
                                        context: CIContext,
                                        linear_cs: CGColorSpace,
                                        threshold_headroom: Float,
-                                       bins: Int = 1024)
+                                       bins: Int = 1024,
+                                       fileName: String? = nil)
 -> (fraction: Double, clipped_pixels: Double, total_pixels: Double)? {
 
     let bin_count = min(max(bins, 1), 2048)
@@ -385,15 +706,16 @@ func fraction_above_headroom_threshold(from ci_image: CIImage,
     let total_px = pixel_count(of: ci_image)
     let clipped_px = frac * total_px
 
-    dbg_log(String(format:
-      "    [fraction_above_headroom_threshold-debug] absMax=%.6f thr=%.6f thrNorm=%.6f binCount=%d thrBin=%d aboveIncl=%.0f total=%.0f frac=%.6f\n",
+    logger.debug(String(format:
+      "fraction_above_headroom_threshold: absMax=%.6f thr=%.6f thrNorm=%.6f binCount=%d thrBin=%d aboveIncl=%.0f total=%.0f frac=%.6f",
       abs_max, Double(threshold_headroom), thr_norm, bin_count, thr_bin, above_incl, total_hist, frac
-    ))
+    ), file: fileName)
 
     return (frac, clipped_px, total_px)
 }
 
 /// Get pixel count using metadata width/height when available; fallback to extent.
+@Sendable
 func pixel_count(of img: CIImage) -> Double {
     let props = img.properties
     if let w = props[kCGImagePropertyPixelWidth as String] as? Int,
@@ -407,6 +729,7 @@ func pixel_count(of img: CIImage) -> Double {
 }
 
 /// Build a BW clip mask (white = clipped) using only standard CI filters.
+@Sendable
 func build_clip_mask_image_no_kernel(hdr: CIImage, threshold_headroom: Float) -> CIImage? {
     var y_img = linear_luma(hdr)
 
@@ -445,12 +768,12 @@ func build_clip_mask_image_no_kernel(hdr: CIImage, threshold_headroom: Float) ->
 }
 
 /// Write a BW clip mask (white=clipped) next to the HEIC.
-@discardableResult
+@discardableResult @Sendable
 func write_clip_mask_no_kernel(hdr: CIImage,
                                    threshold_headroom: Float,
                                    ctx: CIContext,
-                                   out_url: URL) -> URL? {
-    // build mask (identico a prima)
+                                   out_url: URL,
+                                   fileName: String) -> URL? {
     var y_img = linear_luma(hdr)
 
     let sub = CIFilter.colorMatrix()
@@ -506,42 +829,42 @@ func write_clip_mask_no_kernel(hdr: CIImage,
                                         format: .RGB10,
                                         colorSpace: p3_cs,
                                         options: heic_opts)
-        fputs("  • Wrote clip mask HEIC: \(heic_url.path)\n", stderr)
+        logger.log("Wrote clip mask: \(heic_url.lastPathComponent)", file: fileName, level: .success)
         return heic_url
     } catch {
-        fputs("  ! Failed to write clip mask HEIC: \(error)\n", stderr)
+        logger.log("Failed to write clip mask: \(error)", file: fileName, level: .error)
         return nil
     }
 }
 
 /// Write an SDR image where clipped pixels are replaced with a solid color.
-@discardableResult
+@discardableResult @Sendable
 func write_masked_sdr_image(sdr_base: CIImage,
                             mask: CIImage,
                             solid: CIColor,
                             ctx: CIContext,
-                            out_url: URL) -> URL? {
-    // costruzione overlay (identica, cambia solo il writer)
+                            out_url: URL,
+                            fileName: String) -> URL? {
     guard let gen = CIFilter(name: "CIConstantColorGenerator") else {
-        fputs("  ! CIConstantColorGenerator not available\n", stderr)
+        logger.log("CIConstantColorGenerator not available", file: fileName, level: .error)
         return nil
     }
     gen.setValue(solid, forKey: kCIInputColorKey)
     guard let color_infinite = gen.outputImage else {
-        fputs("  ! constantColorGenerator failed\n", stderr)
+        logger.log("constantColorGenerator failed", file: fileName, level: .error)
         return nil
     }
     let color_img = color_infinite.cropped(to: sdr_base.extent)
 
     guard let blend = CIFilter(name: "CIBlendWithMask") else {
-        fputs("  ! CIBlendWithMask not available\n", stderr)
+        logger.log("CIBlendWithMask not available", file: fileName, level: .error)
         return nil
     }
     blend.setValue(color_img, forKey: kCIInputImageKey)
     blend.setValue(sdr_base,  forKey: kCIInputBackgroundImageKey)
     blend.setValue(mask,      forKey: kCIInputMaskImageKey)
     guard let overlaid = blend.outputImage else {
-        fputs("  ! blendWithMask failed\n", stderr)
+        logger.log("blendWithMask failed", file: fileName, level: .error)
         return nil
     }
 
@@ -558,10 +881,10 @@ func write_masked_sdr_image(sdr_base: CIImage,
                                         format: .RGB10,
                                         colorSpace: p3_cs,
                                         options: heic_opts)
-        fputs("  • Wrote masked SDR overlay HEIC: \(heic_url.path)\n", stderr)
+        logger.log("Wrote masked overlay: \(heic_url.lastPathComponent)", file: fileName, level: .success)
         return heic_url
     } catch {
-        fputs("  ! Failed to write masked SDR overlay HEIC: \(error)\n", stderr)
+        logger.log("Failed to write masked overlay: \(error)", file: fileName, level: .error)
         return nil
     }
 }
@@ -580,6 +903,7 @@ struct MakerAppleResult {
     let `default`: Candidate?
 }
 
+@Sendable
 func maker_apple_from_headroom(_ headroom_linear: Float) -> MakerAppleResult {
     let clamped = min(max(headroom_linear, 1.0), 8.0) // up to 3 stops
     let stops = log2f(clamped)
@@ -596,6 +920,7 @@ func maker_apple_from_headroom(_ headroom_linear: Float) -> MakerAppleResult {
     return .init(stops: stops, candidates: cs, default: preferred)
 }
 
+@Sendable
 func stops_from_maker_apple(maker33: Float, maker48: Float) -> (stops: Float, branch: String)? {
     if maker33 < 1.0 {
         if maker48 <= 0.01 { return (-20.0*maker48 + 1.8, "<1 & <=0.01") }
@@ -616,6 +941,7 @@ struct MakerValidationDiffs {
     let branch: String
 }
 
+@Sendable
 func validate_maker_apple(headroom_linear: Float,
                           maker33: Float,
                           maker48: Float,
@@ -636,6 +962,7 @@ func validate_maker_apple(headroom_linear: Float,
 }
 
 // Tonemap SDR via CIToneMapHeadroom using a source headroom ratio and target headroom = 1.0 (SDR)
+@Sendable
 func tonemap_sdr(from hdr: CIImage, headroom_ratio: Float) -> CIImage? {
     hdr.applyingFilter("CIToneMapHeadroom",
                        parameters: ["inputSourceHeadroom": headroom_ratio,
@@ -663,59 +990,83 @@ do {
         .filter { $0.pathExtension.lowercased() == "png" }
         .sorted { $0.lastPathComponent < $1.lastPathComponent }
 } catch {
-    fputs("Cannot list input_HDR: \(error)\n", stderr); exit(73)
+    logger.log("Cannot list input_HDR: \(error)", level: .error)
+    exit(73)
 }
 
 if hdr_files.isEmpty {
-    fputs("No PNG files found in \(input_hdr_dir.path)\n", stderr)
+    logger.log("No PNG files found in \(input_hdr_dir.path)", level: .warning)
     exit(0)
 }
 
+logger.log("Found \(hdr_files.count) HDR file(s) to process")
+if options.parallel {
+    logger.log("Parallel processing enabled (max \(options.max_concurrent) concurrent)")
+}
+
+let stats = RunStats()
+stats.setTotal(hdr_files.count)
+
+// Progress bar enabled only if NOT verbose
+let progressBar = ProgressBar(total: hdr_files.count,
+                             enabled: !options.verbose)
+
+// Display progress bar @0%
+progressBar.showInitial()
+
 // -----------------------------------------------------------------------------
-// Main loop
+// Main processing function
 // -----------------------------------------------------------------------------
-for hdr_url in hdr_files {
+
+func process_file(_ hdr_url: URL, index: Int, total: Int) {
     autoreleasepool {
-        let basename = hdr_url.deletingPathExtension().lastPathComponent
-        let sdr_url = input_sdr_dir.appendingPathComponent(basename).appendingPathExtension("png")
+        let fileName = hdr_url.deletingPathExtension().lastPathComponent
+        let sdr_url = input_sdr_dir.appendingPathComponent(fileName).appendingPathExtension("png")
         let out_url = output_dir
-            .appendingPathComponent(basename + options.output_suffix)
+            .appendingPathComponent(fileName + options.output_suffix)
             .appendingPathExtension("heic")
-        fputs("Processing \(basename)…\n", stderr)
+        
+        logger.log("Processing [\(index)/\(total)]…", file: fileName)
 
         // Load HDR
         guard let hdr = CIImage(contentsOf: hdr_url, options: [.expandToHDR: true]) else {
-            fputs("  ! Cannot read HDR: \(hdr_url.path)\n", stderr); return
+            logger.log("Cannot read HDR: \(hdr_url.path)", file: fileName, level: .error)
+            stats.addFailed(fileName, "Cannot read HDR")
+            return
         }
         guard let hdr_cs = cs_name(hdr.colorSpace), hdr_cs == hdr_required else {
-            fputs("  ! HDR colorspace not Display P3 PQ (got: \(cs_name(hdr.colorSpace) ?? "nil"))\n", stderr); return
+            logger.log("HDR colorspace not Display P3 PQ (got: \(cs_name(hdr.colorSpace) ?? "nil"))",
+                      file: fileName, level: .error)
+            stats.addSkipped(fileName, "Wrong HDR colorspace (expected Display P3 PQ)")
+            return
         }
 
-        // --- headroom measurement (for tonemap + maker apple) ---
+        // --- headroom measurement ---
         let pic_headroom: Float
         let headroom_ratio: Float
 
         if options.use_percentile {
-            // Percentile method
             guard let h = percentile_headroom(from: hdr, context: ctx_linear_p3, linear_cs: linear_p3,
-                                              bins: CI_HISTOGRAM_MAX_BINS, percentile: options.peak_percentile) else {
-                fputs("  ! Cannot compute percentile headroom\n", stderr); return
+                                              bins: CI_HISTOGRAM_MAX_BINS, percentile: options.peak_percentile,
+                                              fileName: fileName) else {
+                logger.log("Cannot compute percentile headroom", file: fileName, level: .error)
+                return
             }
             pic_headroom = h
             headroom_ratio = pic_headroom
 
             let abs_max_peak = max_luminance_hdr(from: hdr, context: ctx_linear_p3, linear_cs: linear_p3) ?? pic_headroom
-            fputs(String(format: "  • Percentile %.3f -> headroom %.3fx (max-peak=%.3fx)\n",
-                         options.peak_percentile, pic_headroom, abs_max_peak), stderr)
+            logger.log(String(format: "Percentile %.1f%% → headroom %.3fx (max-peak=%.3fx)",
+                         options.peak_percentile, pic_headroom, abs_max_peak), file: fileName)
         } else {
-            // Peak-max method (default)
             guard let h = max_luminance_hdr(from: hdr, context: ctx_linear_p3, linear_cs: linear_p3) else {
-                fputs("  ! Cannot compute luminance peak\n", stderr); return
+                logger.log("Cannot compute luminance peak", file: fileName, level: .error)
+                return
             }
             pic_headroom = h
             headroom_ratio = max(1.0, 1.0 + pic_headroom - powf(pic_headroom, options.tonemap_ratio))
-            fputs(String(format: "  • Max-peak=%.3fx -> headroom_ratio=%.3f (tonemap_ratio=%.3f)\n",
-                         pic_headroom, headroom_ratio, options.tonemap_ratio), stderr)
+            logger.log(String(format: "Max-peak=%.3fx → headroom_ratio=%.3f (tonemap_ratio=%.3f)",
+                         pic_headroom, headroom_ratio, options.tonemap_ratio), file: fileName)
         }
 
         if options.tonemap_dryrun {
@@ -723,12 +1074,14 @@ for hdr_url in hdr_files {
                                                             context: ctx_linear_p3,
                                                             linear_cs: linear_p3,
                                                             threshold_headroom: headroom_ratio,
-                                                            bins: 2048) {
-                fputs(String(format: "  [dryrun] Pixels above headroom (%.3fx): %.3f%% (≈%.0f / %.0f)\n",
-                             headroom_ratio, clip.fraction * 100.0, clip.clipped_pixels, clip.total_pixels), stderr)
+                                                            bins: 2048,
+                                                            fileName: fileName) {
+                logger.log(String(format: "[dryrun] Pixels above headroom (%.3fx): %.3f%% (≈%.0f / %.0f)",
+                             headroom_ratio, clip.fraction * 100.0, clip.clipped_pixels, clip.total_pixels),
+                          file: fileName)
             } else {
-                fputs(String(format: "  [dryrun] Pixels above headroom (%.3fx): <n/a> (≈<n/a> / <n/a>)\n",
-                             headroom_ratio), stderr)
+                logger.log(String(format: "[dryrun] Pixels above headroom (%.3fx): <n/a>", headroom_ratio),
+                          file: fileName)
             }
             return
         }
@@ -737,60 +1090,77 @@ for hdr_url in hdr_files {
         let has_sdr = FileManager.default.fileExists(atPath: sdr_url.path)
         let sdr_base: CIImage
         if has_sdr {
-            fputs("  Found SDR counterpart, using it as base image\n", stderr)
+            logger.log("Found SDR counterpart, using it as base image", file: fileName)
             if options.emit_clip_mask || options.emit_masked_image {
-                fputs("  (warning) SDR provided on disk; --emit_clip_mask / --emit_masked_image are ignored because they only apply to the tool’s own tonemapped SDR.\n", stderr)
+                logger.log("SDR provided; --emit_clip_mask / --emit_masked_image ignored (debug overlays are only meaningful when SDR is tone-mapped by the tool)",
+                          file: fileName, level: .warning)
             }
             guard let sdr = CIImage(contentsOf: sdr_url) else {
-                fputs("  ! Cannot read SDR: \(sdr_url.path)\n", stderr); return
+                logger.log("Cannot read SDR: \(sdr_url.path)", file: fileName, level: .error)
+                stats.addFailed(fileName, "Cannot read SDR")
+                return
             }
             let hdr_orient = (hdr.properties[kCGImagePropertyOrientation as String] as? Int) ?? 1
             let sdr_orient = (sdr.properties[kCGImagePropertyOrientation as String] as? Int) ?? 1
             guard hdr_orient == sdr_orient else {
-                fputs("  ! Orientation mismatch (HDR=\(hdr_orient), SDR=\(sdr_orient))\n", stderr); return
+                logger.log("Orientation mismatch (HDR=\(hdr_orient), SDR=\(sdr_orient))",
+                          file: fileName, level: .error)
+                stats.addSkipped(fileName, "Orientation mismatch")
+                return
             }
             guard hdr.extent.size == sdr.extent.size else {
-                fputs("  ! Size mismatch (HDR=\(hdr.extent.size), SDR=\(sdr.extent.size))\n", stderr); return
+                logger.log("Size mismatch (HDR=\(hdr.extent.size), SDR=\(sdr.extent.size))",
+                          file: fileName, level: .error)
+                stats.addSkipped(fileName, "Size mismatch")
+                return
             }
             guard let sdr_cs = cs_name(sdr.colorSpace), sdr_cs == CGColorSpace.displayP3 as String else {
-                fputs("  ! SDR colorspace not Display P3 (got: \(cs_name(sdr.colorSpace) ?? "nil"))\n", stderr); return
+                logger.log("SDR colorspace not Display P3 (got: \(cs_name(sdr.colorSpace) ?? "nil"))",
+                          file: fileName, level: .error)
+                stats.addSkipped(fileName, "Wrong SDR colorspace (expected Display P3)")
+                return
             }
             sdr_base = sdr
         } else {
-            fputs("  SDR image not found, producing one by tonemapping\n", stderr)
+            logger.log("SDR image not found, producing one by tonemapping", file: fileName)
             if options.emit_clip_mask {
                 _ = write_clip_mask_no_kernel(hdr: hdr,
-                                                  threshold_headroom: headroom_ratio,
-                                                  ctx: encode_ctx,
-                                                  out_url: out_url)
+                                              threshold_headroom: headroom_ratio,
+                                              ctx: encode_ctx,
+                                              out_url: out_url,
+                                              fileName: fileName)
             }
             guard let sdr = tonemap_sdr(from: hdr, headroom_ratio: headroom_ratio) else {
-                fputs("  ! Tonemapping failed\n", stderr); return
+                logger.log("Tonemapping failed", file: fileName, level: .error)
+                return
             }
 
             if let clip = fraction_above_headroom_threshold(from: hdr,
                                                             context: ctx_linear_p3,
                                                             linear_cs: linear_p3,
                                                             threshold_headroom: headroom_ratio,
-                                                            bins: CI_HISTOGRAM_MAX_BINS) {
-                fputs(String(format: "  • Pixels above headroom (%.3fx): %.3f%% (≈%.0f px)\n",
-                             headroom_ratio, clip.fraction * 100.0, clip.total_pixels * clip.fraction), stderr)
+                                                            bins: CI_HISTOGRAM_MAX_BINS,
+                                                            fileName: fileName) {
+                logger.log(String(format: "Pixels above headroom (%.3fx): %.3f%% (≈%.0f px)",
+                             headroom_ratio, clip.fraction * 100.0, clip.total_pixels * clip.fraction),
+                          file: fileName)
             } else {
-                fputs("  • Clip fraction: <n/a>\n", stderr)
+                logger.log("Clip fraction: <n/a>", file: fileName)
             }
 
             sdr_base = sdr
 
-            if options.emit_masked_image && !options.tonemap_dryrun {
+            if options.emit_masked_image {
                 if let clip_mask = build_clip_mask_image_no_kernel(hdr: hdr, threshold_headroom: headroom_ratio) {
                     let color = parse_color(options.masked_color)
                     _ = write_masked_sdr_image(sdr_base: sdr_base,
                                                mask: clip_mask,
                                                solid: color,
                                                ctx: encode_ctx,
-                                               out_url: out_url)
+                                               out_url: out_url,
+                                               fileName: fileName)
                 } else {
-                    fputs("  ! Failed to build clip mask (overlay skipped)\n", stderr)
+                    logger.log("Failed to build clip mask (overlay skipped)", file: fileName, level: .warning)
                 }
             }
         }
@@ -798,7 +1168,8 @@ for hdr_url in hdr_files {
         // Maker Apple metadata
         let maker = maker_apple_from_headroom(pic_headroom)
         guard let chosen = maker.default else {
-            fputs("  ! No valid makerApple pair for headroom=\(pic_headroom)\n", stderr); return
+            logger.log("No valid makerApple pair for headroom=\(pic_headroom)", file: fileName, level: .error)
+            return
         }
 
         let headroom_for_meta = powf(2.0, max(maker.stops, 0.0))
@@ -808,12 +1179,14 @@ for hdr_url in hdr_files {
                                        tol_stops_abs: 0.01,
                                        tol_headroom_rel: 0.02)
         if let d = val.diffs, !val.ok {
-            fputs(String(format: "  ! makerApple validation failed (branch=%@, Δstops=%.4f, relΔ=%.2f%%)\n",
-                         d.branch, d.abs_stops_diff, d.rel_headroom_diff*100), stderr)
+            logger.log(String(format: "makerApple validation failed (branch=%@, Δstops=%.4f, relΔ=%.2f%%)",
+                         d.branch, d.abs_stops_diff, d.rel_headroom_diff*100),
+                      file: fileName, level: .error)
             return
         }
         if pic_headroom > 8.0 {
-            fputs(String(format: "  • Headroom %.3f× exceeds metadata limit (8×). Clamped makerApple to 8×.\n", pic_headroom), stderr)
+            logger.log(String(format: "Headroom %.3fx exceeds metadata limit (8×). Clamped makerApple to 8×.",
+                       pic_headroom), file: fileName, level: .warning)
         }
 
         // Build temp HEIC to get the gain map
@@ -826,11 +1199,15 @@ for hdr_url in hdr_files {
                                                            format: .RGB10,
                                                            colorSpace: p3_cs,
                                                            options: tmp_options) else {
-            fputs("  ! Failed to build temp HEIC\n", stderr); return
+            logger.log("Failed to build temp HEIC", file: fileName, level: .error)
+            stats.addFailed(fileName, "Failed to build temp HEIC")
+            return
         }
 
         guard let gain_map = CIImage(data: tmp_data, options: [.auxiliaryHDRGainMap: true]) else {
-            fputs("  ! Failed to extract gain map from temp HEIC\n", stderr); return
+            logger.log("Failed to extract gain map from temp HEIC", file: fileName, level: .error)
+            stats.addFailed(fileName, "No gain map extracted")
+            return
         }
 
         // Apply Maker Apple metadata
@@ -852,11 +1229,50 @@ for hdr_url in hdr_files {
                                                    format: .RGB10,
                                                    colorSpace: p3_cs,
                                                    options: export_options)
-            fputs("  ✔ Wrote: \(out_url.path)\n", stderr)
+            logger.log("Wrote: \(out_url.lastPathComponent)", file: fileName, level: .success)
+       
+            // Post-export verification (enabled by default; can be skipped via --do_not_verify)
+            if !options.do_not_verify {
+               if !verifyGainMap(at: out_url, fileName: fileName) {
+                   logger.log("Gain map might be missing in output!", file: fileName, level: .warning)
+               }
+            }
         } catch {
-            fputs("  ! Export failed: \(error)\n", stderr)
+            logger.log("Export failed: \(error)", file: fileName, level: .error)
         }
     }
 }
 
-fputs("Done.\n", stderr)
+// -----------------------------------------------------------------------------
+// Main loop
+// -----------------------------------------------------------------------------
+
+if options.parallel {
+    let queue = DispatchQueue(label: "hdr.processing", attributes: .concurrent)
+    let semaphore = DispatchSemaphore(value: options.max_concurrent)
+    
+    for (index, hdr_url) in hdr_files.enumerated() {
+        semaphore.wait()
+        queue.async {
+        defer {
+                let fileName = hdr_url.deletingPathExtension().lastPathComponent
+                progressBar.increment(fileName: fileName)
+                semaphore.signal()
+            }
+            process_file(hdr_url, index: index + 1, total: hdr_files.count)
+        }
+    }
+    
+    queue.sync(flags: .barrier) {}
+    progressBar.finish()
+} else {
+    for (index, hdr_url) in hdr_files.enumerated() {
+        process_file(hdr_url, index: index + 1, total: hdr_files.count)
+        let fileName = hdr_url.deletingPathExtension().lastPathComponent
+        progressBar.increment(fileName: fileName)
+    }
+    progressBar.finish()
+}
+
+printSummary(stats: stats, color: !options.no_color && isatty(fileno(stderr)) != 0)
+logger.log("Done.", level: .success)
