@@ -7,6 +7,10 @@ import ImageIO
 // Thread-Safe Logger
 // -----------------------------------------------------------------------------
 
+/// Thread-safe logger with optional ANSI colors, file logging, and debug levels.
+/// - Prints to stderr only when `--verbose` is set.
+/// - Always writes to file when `--write_log` is used (with an optional path).
+/// - Color output is disabled automatically if stderr is not a TTY or `--no_color` is set.
 final class Logger {
     private let queue = DispatchQueue(label: "logger.serial")
     private let showDebug: Bool
@@ -25,7 +29,7 @@ final class Logger {
         self.showDebug = debug
         self.verbose = verbose
         self.writeLog = writeLog
-        // Colors active only if required and if stderr is a TTY
+        // Colors are active only if requested and if stderr is a TTY.
         self.enableColor = enableColor && isatty(fileno(stderr)) != 0
         if let path = logFile, writeLog {
             self.logFileURL = URL(fileURLWithPath: path)
@@ -34,6 +38,7 @@ final class Logger {
         }
     }
     
+    /// Log a message (thread-safe). Printed to stderr only if `--verbose`, always written to log file if enabled.
     func log(_ message: String, file: String? = nil, level: LogLevel = .info) {
         queue.async {
             var fullMessage = self.makePrefix(file: file, level: level) + message + "\n"
@@ -65,6 +70,7 @@ final class Logger {
         return code.isEmpty ? s : code + s + reset
     }
     
+    /// Convenience for debug-level messages (no-op if `debug` is false).
     func debug(_ message: String, file: String? = nil) {
         guard showDebug else { return }
         log(message, file: file, level: .debug)
@@ -115,6 +121,7 @@ final class Logger {
     }
 }
 
+/// Thread-safe run statistics used for the end-of-run summary.
 final class RunStats {
     private let q = DispatchQueue(label: "runstats.serial")
     private(set) var total = 0
@@ -128,6 +135,7 @@ final class RunStats {
     func addFailed(_ f: String, _ why: String)  { q.sync { failed.append((f, why)) } }
 }
 
+/// Pretty-prints a colored summary to stderr (colors are disabled if `color` is false).
 func printSummary(stats: RunStats, color: Bool) {
     let red    = color ? "\u{001B}[31m" : ""
     let yellow = color ? "\u{001B}[33m" : ""
@@ -170,7 +178,7 @@ let output_dir     = URL(fileURLWithPath: "./output_HDR_with_gainmap/", isDirect
 let output_clipped_mask_dir    = URL(fileURLWithPath: "./output_clipped_mask/", isDirectory: true)
 let output_clipped_overlay_dir = URL(fileURLWithPath: "./output_clipped_overlay/", isDirectory: true)
 
-// number of bins when building histograms (max allowed by CIAreaHistogram is 2048)
+// Number of bins when building histograms (max allowed by CIAreaHistogram is 2048).
 let CI_HISTOGRAM_MAX_BINS = 2048
 
 // -----------------------------------------------------------------------------
@@ -196,6 +204,7 @@ struct Options {
     var log_file: String = "./hdr2gainmap.log"
     var no_color: Bool = false
     var do_not_verify: Bool = false
+    var heif_strategy: String = "auto" // auto|heif|heif10
 }
 
 @discardableResult
@@ -204,7 +213,7 @@ func print_usage(_ prog: String) -> Int32 {
     Usage:
       \(prog) [--suffix <text>] [--peak_percentile [value]] [--peak_max]
              [--tonemap_ratio <0..1>] [--heic_compression_quality <0..1>]
-             [--tonemap_dryrun] [--emit_clip_mask] [--emit_masked_image [color]]
+             [--tonemap_dryrun] [--heif_strategy] [--emit_clip_mask] [--emit_masked_image [color]]
              [--parallel] [--max_concurrent <n>]
              [--verbose] [--write_log [path]] [--do_not_verify] [--no_color] [--debug]
 
@@ -215,6 +224,7 @@ func print_usage(_ prog: String) -> Int32 {
       --tonemap_ratio <0..1>          Blend curve for peak_max (default 0.2)
       --heic_compression_quality <v>  HEIC lossy quality in [0,1] (default 0.97)
       --tonemap_dryrun                Only compute headroom + clipped fraction; no HEIC output
+      --heif_strategy <s>             HEIF encoder strategy for the FINAL HEIC only (auto|heif|heif10; default: auto)
       --emit_clip_mask                Also write a black/white mask of clipped pixels
                                       (ignored if an SDR file already exists)
       --emit_masked_image [col]       Also write SDR with clipped pixels painted (name or #RRGGBB; default: magenta)
@@ -243,11 +253,12 @@ func parse_options(_ argv: [String]) -> Options {
     var opts = Options()
     let allowed = Set([
         "--suffix","--peak_percentile","--peak_max","--tonemap_ratio",
-        "--heic_compression_quality",
+        "--heic_compression_quality","--heif_strategy",
         "--tonemap_dryrun","--emit_clip_mask","--emit_masked_image",
         "--parallel","--max_concurrent",
-        "--verbose","--write_log","--no_color","--do_not_verify","--debug","--help"
+        "--verbose","--write_log","--no_color","--debug","--help"
     ])
+
     var i = 1
     let n = argv.count
     let prog = (argv.first ?? "prog")
@@ -309,6 +320,19 @@ func parse_options(_ argv: [String]) -> Options {
             opts.heic_compression_quality = v
             i += 2
 
+        case "--heif_strategy":
+            guard i+1 < n, !argv[i+1].hasPrefix("-") else {
+                fputs("Option --heif_strategy requires a value: auto|heif|heif10\n", stderr)
+                exit(print_usage(prog))
+            }
+            let v = argv[i+1].lowercased()
+            guard ["auto","heif","heif10"].contains(v) else {
+                fputs("Invalid --heif_strategy. Use: auto|heif|heif10\n", stderr)
+                exit(print_usage(prog))
+            }
+            opts.heif_strategy = v
+            i += 2
+            
         case "--emit_clip_mask":
             opts.emit_clip_mask = true
             i += 1
@@ -372,7 +396,7 @@ let logger = Logger(debug: options.debug,
                     logFile: options.log_file,
                     enableColor: !options.no_color)
 
-/// Progress bar
+/// Minimal progress bar that renders to a single TTY line.
 final class ProgressBar {
     private let queue = DispatchQueue(label: "progressbar.serial")
     private var current: Int = 0
@@ -386,17 +410,18 @@ final class ProgressBar {
         self.enabled = enabled
     }
     
-    /// Prints progress bar immediatly @0% (before any job finishes)
+    /// Prints progress bar immediately at 0% (before any job finishes).
     func showInitial(fileName: String? = nil) {
          guard enabled else { return }
          queue.sync {
-            // evita doppie stampe dello 0% se chiamata più volte
+            // Avoid printing 0% twice if called repeatedly.
             guard !hasPrintedInitial else { return }
             hasPrintedInitial = true
             self.render(fileName: fileName)
         }
     }
     
+    /// Increments the progress by one unit and re-renders the bar.
     func increment(fileName: String? = nil) {
         guard enabled else { return }
         
@@ -419,7 +444,7 @@ final class ProgressBar {
             line += " - \(file)"
         }
         
-        // Pad with spaces to clear previous text
+        // Pad with spaces to clear previous text.
         line += String(repeating: " ", count: 20)
         
         fputs(line, stderr)
@@ -430,9 +455,10 @@ final class ProgressBar {
         }
     }
     
+    /// Flushes pending renders and prints a final newline.
     func finish() {
         guard enabled else { return }
-        // Flush: make sure that queued renders if any are completed
+        // Flush: make sure that queued renders if any are completed.
         queue.sync { /* no-op */ }
         fputs("\n", stderr)
         fflush(stderr)
@@ -460,7 +486,7 @@ if options.use_percentile && options.debug {
     logger.debug("Note: --tonemap_ratio is ignored with --peak_percentile.")
 }
 
-// Create optional output folders
+// Create optional output folders when debug overlays are requested.
 if options.emit_clip_mask {
     var is_dir2: ObjCBool = false
     if !FileManager.default.fileExists(atPath: output_clipped_mask_dir.path, isDirectory: &is_dir2) {
@@ -492,16 +518,135 @@ if options.emit_masked_image {
 // Utilities
 // -----------------------------------------------------------------------------
 
-/// Check for gain map
+/// Strategy for final HEIC write: either legacy HEIF path, HEIF-10 path, or automatic selection.
+enum HEIFStrategy: String {
+    case auto
+    case heif      // writeHEIFRepresentation
+    case heif10    // writeHEIF10Representation
+}
+
 @Sendable
-func verifyGainMap(at url: URL, fileName: String) -> Bool {
-    // Se riusciamo a leggere l’immagine ausiliaria HDR gain map, allora è presente.
-    if let _ = CIImage(contentsOf: url, options: [.auxiliaryHDRGainMap: true]) {
-        logger.debug("Gain map verified present", file: fileName)
-        return true
-    } else {
+func parseStrategy(_ s: String) -> HEIFStrategy {
+    HEIFStrategy(rawValue: s.lowercased()) ?? .auto
+}
+
+/// Returns a string like "arm64" or "x86_64" for the current machine architecture.
+@Sendable
+func currentArchitecture() -> String {
+    var sysinfo = utsname(); uname(&sysinfo)
+    return withUnsafePointer(to: &sysinfo.machine) {
+        $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+            String(validatingUTF8: $0) ?? "unknown"
+        }
+    }
+}
+
+/// Attempts to verify the presence of an auxiliary HDR gain map by loading it from the file container.
+/// Returns `true` if an auxiliary image is returned and has a valid, non-empty extent.
+@Sendable
+func verifyGainMap(at url: URL,
+                   logger: Logger? = nil,
+                   fileName: String? = nil) -> Bool {
+    // Try to load the gain map as an auxiliary image.
+    guard let gainMap = CIImage(contentsOf: url, options: [.auxiliaryHDRGainMap: true]) else {
+        logger?.debug("verifyGainMap: no auxiliary HDR gain map found", file: fileName)
         return false
     }
+    // Consider valid only if area > 0 (some containers could return a placeholder).
+    let ok = gainMap.extent.width > 0 && gainMap.extent.height > 0
+    logger?.debug("verifyGainMap: gain map extent = \(Int(gainMap.extent.width))×\(Int(gainMap.extent.height)), ok=\(ok)",
+                  file: fileName)
+    return ok
+}
+
+enum HEIFEncodeError: Error {
+    case missingGainMapAfterWrite
+}
+
+/// Writes a HEIC using the requested encoder strategy (heif/heif10/auto) and optionally verifies
+/// the gain-map presence. In `auto` mode, it tries an architecture-based order (arm → heif10 first).
+@Sendable
+func writeHEIFChoosingEncoder(ctx: CIContext,
+                              image: CIImage,
+                              url: URL,
+                              colorSpace: CGColorSpace,
+                              format: CIFormat,
+                              options: [CIImageRepresentationOption: Any],
+                              verify: Bool,
+                              logger: Logger,
+                              fileName: String,
+                              strategy: HEIFStrategy,
+                              archHint: String) throws {
+    // Choose encoder order based on strategy.
+    let tryOrder: [HEIFStrategy] = {
+        switch strategy {
+        case .heif:   return [.heif]
+        case .heif10: return [.heif10]
+        case .auto:
+            // Heuristic: on arm* try HEIF-10 first, otherwise try legacy HEIF first.
+            if archHint.lowercased().contains("arm") {
+                return [.heif10, .heif]
+            } else {
+                return [.heif, .heif10]
+            }
+        }
+    }()
+
+    func tryWrite(using strat: HEIFStrategy) throws {
+        switch strat {
+        case .heif:
+            try ctx.writeHEIFRepresentation(of: image,
+                                            to: url,
+                                            format: format,
+                                            colorSpace: colorSpace,
+                                            options: options)
+        case .heif10:
+            try ctx.writeHEIF10Representation(of: image,
+                                              to: url,
+                                              colorSpace: colorSpace,
+                                              options: options)
+        case .auto:
+            // Should never happen: the strategy is expanded before.
+            break
+        }
+    }
+
+    // Try in order; if `verify == true`, check gain-map presence and retry with the next encoder if missing.
+    var lastError: Error?
+    for (idx, strat) in tryOrder.enumerated() {
+        do {
+            // Write with selected encoder.
+            try tryWrite(using: strat)
+            logger.debug("writeHEIFChoosingEncoder: wrote with \(strat)", file: fileName)
+
+            // Verify (if requested).
+            if verify {
+                if verifyGainMap(at: url, logger: logger, fileName: fileName) {
+                    return // OK, done.
+                } else {
+                    logger.debug("writeHEIFChoosingEncoder: gain map missing after \(strat)", file: fileName)
+                    // If not last attempt, try the other encoder.
+                    if idx < tryOrder.count - 1 {
+                        continue
+                    } else {
+                        throw HEIFEncodeError.missingGainMapAfterWrite
+                    }
+                }
+            } else {
+                return // No verification requested → consider success.
+            }
+        } catch {
+            // Write error.
+            lastError = error
+            logger.debug("writeHEIFChoosingEncoder: write failed with \(strat): \(error)", file: fileName)
+            // If not the last encoder, try the next one.
+            if idx < tryOrder.count - 1 { continue } else { throw error }
+        }
+    }
+
+    // If we reach here, there was no return above: rethrow the last known error or a missing gain-map error.
+    if let e = lastError { throw e }
+    throw HEIFEncodeError.missingGainMapAfterWrite
 }
 
 /// Parse a color string into CIColor. Accepts simple names or "#RRGGBB".
@@ -527,7 +672,7 @@ func parse_color(_ s: String) -> CIColor {
     }
 }
 
-/// Return the canonical CGColorSpace name as String (or nil if untagged)
+/// Return the canonical CGColorSpace name as String (or nil if untagged).
 @Sendable
 func cs_name(_ cs: CGColorSpace?) -> String? {
     guard let cs = cs, let name = cs.name else { return nil }
@@ -903,6 +1048,7 @@ struct MakerAppleResult {
     let `default`: Candidate?
 }
 
+/// Computes possible Maker Apple metadata pairs from a linear headroom factor.
 @Sendable
 func maker_apple_from_headroom(_ headroom_linear: Float) -> MakerAppleResult {
     let clamped = min(max(headroom_linear, 1.0), 8.0) // up to 3 stops
@@ -920,6 +1066,7 @@ func maker_apple_from_headroom(_ headroom_linear: Float) -> MakerAppleResult {
     return .init(stops: stops, candidates: cs, default: preferred)
 }
 
+/// Inverse mapping: from Maker Apple metadata back to stops (and branch label).
 @Sendable
 func stops_from_maker_apple(maker33: Float, maker48: Float) -> (stops: Float, branch: String)? {
     if maker33 < 1.0 {
@@ -941,6 +1088,7 @@ struct MakerValidationDiffs {
     let branch: String
 }
 
+/// Validates that the chosen Maker Apple pair encodes (within tolerances) the target headroom.
 @Sendable
 func validate_maker_apple(headroom_linear: Float,
                           maker33: Float,
@@ -961,7 +1109,7 @@ func validate_maker_apple(headroom_linear: Float,
                       rel_headroom_diff: rel_headroom_diff, branch: branch))
 }
 
-// Tonemap SDR via CIToneMapHeadroom using a source headroom ratio and target headroom = 1.0 (SDR)
+/// Tone-maps an HDR CIImage to SDR using `CIToneMapHeadroom`.
 @Sendable
 func tonemap_sdr(from hdr: CIImage, headroom_ratio: Float) -> CIImage? {
     hdr.applyingFilter("CIToneMapHeadroom",
@@ -972,6 +1120,10 @@ func tonemap_sdr(from hdr: CIImage, headroom_ratio: Float) -> CIImage? {
 // -----------------------------------------------------------------------------
 // Per-file processing setup
 // -----------------------------------------------------------------------------
+
+let arch = currentArchitecture()
+let heifStrategy = parseStrategy(options.heif_strategy)
+logger.debug("Architecture: \(arch); HEIF strategy: \(options.heif_strategy)")
 
 let linear_p3 = CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)!
 let ctx_linear_p3 = CIContext(options: [.workingColorSpace: linear_p3,
@@ -1018,6 +1170,11 @@ progressBar.showInitial()
 // Main processing function
 // -----------------------------------------------------------------------------
 
+/// Processes a single HDR file end-to-end:
+/// - Validates HDR/SDR inputs and metadata
+/// - Computes headroom (percentile or max-based)
+/// - Optionally tone-maps SDR and writes debugging overlays
+/// - Encodes gain map + Maker Apple metadata into the final HEIC
 func process_file(_ hdr_url: URL, index: Int, total: Int) {
     autoreleasepool {
         let fileName = hdr_url.deletingPathExtension().lastPathComponent
@@ -1189,7 +1346,7 @@ func process_file(_ hdr_url: URL, index: Int, total: Int) {
                        pic_headroom), file: fileName, level: .warning)
         }
 
-        // Build temp HEIC to get the gain map
+        // Build temp HEIC to get the gain map (Core Image generates a gain map for us).
         let tmp_options: [CIImageRepresentationOption : Any] = [
             kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 1.0,
             CIImageRepresentationOption.hdrImage: hdr,
@@ -1210,7 +1367,7 @@ func process_file(_ hdr_url: URL, index: Int, total: Int) {
             return
         }
 
-        // Apply Maker Apple metadata
+        // Apply Maker Apple metadata (keys 33 and 48) to the SDR base image prior to export.
         var props = hdr.properties
         var maker_apple = props[kCGImagePropertyMakerAppleDictionary as String] as? [String: Any] ?? [:]
         maker_apple["33"] = chosen.maker33
@@ -1218,27 +1375,31 @@ func process_file(_ hdr_url: URL, index: Int, total: Int) {
         props[kCGImagePropertyMakerAppleDictionary as String] = maker_apple
         let sdr_with_props = sdr_base.settingProperties(props)
 
+        // Final HEIC export options with explicit gain map attached.
         let export_options: [CIImageRepresentationOption: Any] = [
             kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: options.heic_compression_quality,
             CIImageRepresentationOption.hdrGainMapImage: gain_map,
             CIImageRepresentationOption.hdrGainMapAsRGB: false
         ]
         do {
-            try encode_ctx.writeHEIFRepresentation(of: sdr_with_props,
-                                                   to: out_url,
-                                                   format: .RGB10,
-                                                   colorSpace: p3_cs,
-                                                   options: export_options)
+            try writeHEIFChoosingEncoder(
+                ctx: encode_ctx,
+                image: sdr_with_props,
+                url: out_url,
+                colorSpace: p3_cs,
+                format: .RGB10,
+                options: export_options,
+                verify: !options.do_not_verify,
+                logger: logger,
+                fileName: fileName,
+                strategy: heifStrategy,
+                archHint: arch
+            )
             logger.log("Wrote: \(out_url.lastPathComponent)", file: fileName, level: .success)
-       
-            // Post-export verification (enabled by default; can be skipped via --do_not_verify)
-            if !options.do_not_verify {
-               if !verifyGainMap(at: out_url, fileName: fileName) {
-                   logger.log("Gain map might be missing in output!", file: fileName, level: .warning)
-               }
-            }
+            stats.incWritten()
         } catch {
             logger.log("Export failed: \(error)", file: fileName, level: .error)
+            stats.addFailed(fileName, "Export failed: \(error)")
         }
     }
 }
@@ -1254,7 +1415,7 @@ if options.parallel {
     for (index, hdr_url) in hdr_files.enumerated() {
         semaphore.wait()
         queue.async {
-        defer {
+            defer {
                 let fileName = hdr_url.deletingPathExtension().lastPathComponent
                 progressBar.increment(fileName: fileName)
                 semaphore.signal()
@@ -1274,5 +1435,6 @@ if options.parallel {
     progressBar.finish()
 }
 
+// Print final summary (colored if stderr is a TTY and --no_color is not set).
 printSummary(stats: stats, color: !options.no_color && isatty(fileno(stderr)) != 0)
 logger.log("Done.", level: .success)
