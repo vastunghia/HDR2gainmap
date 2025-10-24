@@ -256,7 +256,7 @@ func parse_options(_ argv: [String]) -> Options {
         "--heic_compression_quality","--heif_strategy",
         "--tonemap_dryrun","--emit_clip_mask","--emit_masked_image",
         "--parallel","--max_concurrent",
-        "--verbose","--write_log","--no_color","--debug","--help"
+        "--verbose","--write_log","--no_color","--do_not_verify","--debug","--help"
     ])
 
     var i = 1
@@ -1413,8 +1413,8 @@ if options.parallel {
     let semaphore = DispatchSemaphore(value: options.max_concurrent)
     
     for (index, hdr_url) in hdr_files.enumerated() {
-        semaphore.wait()
         queue.async {
+            semaphore.wait()
             defer {
                 let fileName = hdr_url.deletingPathExtension().lastPathComponent
                 progressBar.increment(fileName: fileName)

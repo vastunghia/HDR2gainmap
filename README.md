@@ -167,6 +167,21 @@ Options:
   --help                            Show this message
 ```
 
+## Troubleshooting
+
+### "Cannot read HDR" error
+- Ensure PNG is tagged with Display P3 PQ profile
+- Re-export from your editor with explicit colorspace
+
+### "No gain map extracted" error
+- Try `--heif_strategy heif10` or `--heif_strategy heif`
+- Update macOS to latest version
+- Check with Adobe Gain Map Demo App
+
+### Progress bar doesn't update
+- Disable with `--verbose` to see detailed logs
+- Check file permissions on output directories
+
 ### Logging behavior
 
 - **Default:** Progress bar only, minimal console noise, per‑file logs go to the optional log file if `--write_log` is used.
@@ -262,8 +277,8 @@ controls which encoder is tried:
 
 ## Compatibility
 
-- **Tested** on **Intel‑based Mac** running **macOS 15.7**.  
-- On some **Apple Silicon** systems, switching to `writeHEIF10Representation` (or using `--heif_strategy heif10`) may be required.
+- **Tested** on both **Intel-** and **Silicon‑based Mac** running **macOS 15.x** -- both work fine with `--heif_strategy [auto | heif]`, do not work with `--heif_strategy heif10`.
+- On some systems (possibly macOS 26? More tests needed), switching using `--heif_strategy heif10` may be required.
 
 ---
 
